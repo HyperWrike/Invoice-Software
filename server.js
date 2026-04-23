@@ -6,6 +6,7 @@ const path = require('path');
 const express = require('express');
 
 const { router: authRouter } = require('./src/auth');
+const { initPromise } = require('./src/db');
 const { requestContext, baseLog, reqMeta, sanitizeError } = require('./src/logger');
 const { corsMiddleware, securityHeaders } = require('./src/middleware/security');
 const businesses = require('./src/routes/businesses');
@@ -64,9 +65,19 @@ app.use((err, req, res, _next) => {
 });
 
 if (require.main === module) {
-    app.listen(PORT, () => {
-        baseLog('info', 'Invoice Software server started', { port: PORT, nodeEnv: process.env.NODE_ENV || 'development' });
-    });
+    initPromise
+        .then(() => {
+            app.listen(PORT, () => {
+                baseLog('info', 'Invoice Software server started', {
+                    port: PORT,
+                    nodeEnv: process.env.NODE_ENV || 'development'
+                });
+            });
+        })
+        .catch((err) => {
+            baseLog('error', 'Failed to initialize database', { error: sanitizeError(err) });
+            process.exit(1);
+        });
 }
 
 module.exports = app;
