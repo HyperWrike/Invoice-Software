@@ -1,7 +1,34 @@
 /* Clean frontend entrypoint for the internal billing app */
+function createSafeStorage() {
+    try {
+        const testKey = '__storage_test__';
+        window.localStorage.setItem(testKey, '1');
+        window.localStorage.removeItem(testKey);
+        return window.localStorage;
+    } catch {
+        const memory = new Map();
+        return {
+            getItem: (key) => (memory.has(key) ? memory.get(key) : null),
+            setItem: (key, value) => { memory.set(key, String(value)); },
+            removeItem: (key) => { memory.delete(key); }
+        };
+    }
+}
+
+const storage = createSafeStorage();
+
+function readStoredJson(key) {
+    try {
+        const value = storage.getItem(key);
+        return value ? JSON.parse(value) : null;
+    } catch {
+        return null;
+    }
+}
+
 const State = {
-    token: localStorage.getItem('token') || null,
-    user: JSON.parse(localStorage.getItem('user') || 'null'),
+    token: storage.getItem('token') || null,
+    user: readStoredJson('user'),
     business: null,
     route: 'dashboard'
 };
@@ -113,15 +140,23 @@ async function confirmDialog(message, danger = false) {
 function saveSession(data) {
     State.token = data.token;
     State.user = data.user;
-    localStorage.setItem('token', data.token);
-    localStorage.setItem('user', JSON.stringify(data.user));
-    if (data.businessId) localStorage.setItem('businessId', String(data.businessId));
+    try {
+        storage.setItem('token', data.token);
+        storage.setItem('user', JSON.stringify(data.user));
+        if (data.businessId) storage.setItem('businessId', String(data.businessId));
+    } catch {
+        // Some browser contexts disallow persistent storage; the session can still continue in-memory.
+    }
 }
 
 function logout() {
-    localStorage.removeItem('token');
-    localStorage.removeItem('user');
-    localStorage.removeItem('businessId');
+    try {
+        storage.removeItem('token');
+        storage.removeItem('user');
+        storage.removeItem('businessId');
+    } catch {
+        // Ignore storage failures during sign-out.
+    }
     State.token = null;
     State.user = null;
     State.business = null;

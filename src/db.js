@@ -9,6 +9,8 @@
  */
 const { Pool } = require('pg');
 const { AsyncLocalStorage } = require('node:async_hooks');
+const { isIP } = require('node:net');
+const dns = require('node:dns').promises;
 
 const SUPABASE_DB_URL = process.env.SUPABASE_DB_URL || process.env.DATABASE_URL;
 
@@ -19,10 +21,60 @@ if (!SUPABASE_DB_URL) {
     );
 }
 
-const pool = new Pool({
-    connectionString: SUPABASE_DB_URL,
-    ssl: process.env.PGSSL === 'false' ? false : { rejectUnauthorized: false }
-});
+async function createPool() {
+    const url = new URL(SUPABASE_DB_URL);
+    const originalHost = url.hostname.replace(/^\[(.*)\]$/, '$1');
+    const sslEnabled = process.env.PGSSL === 'false' ? false : { rejectUnauthorized: false };
+    const baseConfig = {
+        user: decodeURIComponent(url.username || ''),
+        password: decodeURIComponent(url.password || ''),
+        database: decodeURIComponent(url.pathname.replace(/^\//, '')),
+        port: Number(url.port || 5432),
+        ssl: sslEnabled,
+        max: Number(process.env.PG_POOL_MAX || 3),
+        connectionTimeoutMillis: Number(process.env.PG_CONNECT_TIMEOUT_MS || 5000),
+        idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 30000),
+        query_timeout: Number(process.env.PG_QUERY_TIMEOUT_MS || 10000)
+    };
+
+    if (isIP(originalHost)) {
+        return new Pool({
+            ...baseConfig,
+            host: originalHost
+        });
+    }
+
+    if (!isIP(originalHost)) {
+        try {
+            const ipv6 = await dns.resolve6(originalHost);
+            if (ipv6 && ipv6.length > 0) {
+                url.hostname = ipv6[0];
+                if (sslEnabled && typeof sslEnabled === 'object') {
+                    sslEnabled.servername = originalHost;
+                }
+            }
+        } catch {
+            try {
+                const ipv4 = await dns.resolve4(originalHost);
+                if (ipv4 && ipv4.length > 0) {
+                    url.hostname = ipv4[0];
+                    if (sslEnabled && typeof sslEnabled === 'object') {
+                        sslEnabled.servername = originalHost;
+                    }
+                }
+            } catch {
+                // Fall back to the original hostname if DNS resolution fails here.
+            }
+        }
+    }
+
+    return new Pool({
+        connectionString: url.toString(),
+        ...baseConfig
+    });
+}
+
+const poolPromise = createPool();
 
 const txStorage = new AsyncLocalStorage();
 
@@ -38,7 +90,7 @@ function transformSql(sql) {
     out = out.replace(/datetime\('now'\)/gi, 'NOW()');
     out = out.replace(/date\('now'\s*,\s*'-12 months'\)/gi, "(CURRENT_DATE - INTERVAL '12 months')");
     out = out.replace(/date\('now'\)/gi, 'CURRENT_DATE');
-    out = out.replace(/strftime\('%Y-%m',\s*([^)]+)\)/gi, "TO_CHAR($1, 'YYYY-MM')");
+    out = out.replace(/strftime\('%Y-%m',\s*([^)]+)\)/gi, (_m, expr) => `TO_CHAR(${String(expr).trim()}, 'YYYY-MM')`);
     // `date(col)` comparisons collapse into the column itself (already DATE).
     out = out.replace(/date\(\s*([a-zA-Z_][\w\.]*)\s*\)/gi, '$1');
     // LIKE is case-sensitive in Postgres; prefer ILIKE for the search patterns used here.
@@ -76,10 +128,15 @@ function transformSql(sql) {
     return result;
 }
 
-async function executeQuery(sql, params) {
+async function executeQueryRaw(sql, params) {
     const text = transformSql(sql);
-    const client = txStorage.getStore() || pool;
+    const client = txStorage.getStore() || await poolPromise;
     return client.query(text, params);
+}
+
+async function executeQuery(sql, params) {
+    await initPromise;
+    return executeQueryRaw(sql, params);
 }
 
 /**
@@ -102,7 +159,7 @@ function coerceRow(row) {
 
 function prepare(sql) {
     return {
-        async get(...params) {
+        get: async(...params) => {
             const r = await executeQuery(sql, params);
             return r.rows[0] ? coerceRow(r.rows[0]) : undefined;
         },
@@ -116,9 +173,9 @@ function prepare(sql) {
             const hasReturning = /\breturning\b/i.test(normalized);
             const runSql = isInsert && !hasReturning ? `${normalized} RETURNING id` : normalized;
             const r = await executeQuery(runSql, params);
-            const lastInsertRowid = r.rows && r.rows[0] && r.rows[0].id != null
-                ? Number(r.rows[0].id)
-                : undefined;
+            const lastInsertRowid = r.rows && r.rows[0] && r.rows[0].id != null ?
+                Number(r.rows[0].id) :
+                undefined;
             return {
                 changes: r.rowCount || 0,
                 lastInsertRowid
@@ -132,7 +189,9 @@ function prepare(sql) {
  * and resolves with whatever `fn` returns.
  */
 function transaction(fn) {
-    return async (...args) => {
+    return async(...args) => {
+        await initPromise;
+        const pool = await poolPromise;
         const client = await pool.connect();
         try {
             await client.query('BEGIN');
@@ -149,7 +208,7 @@ function transaction(fn) {
 }
 
 async function exec(sql) {
-    const client = txStorage.getStore() || pool;
+    const client = txStorage.getStore() || (await poolPromise);
     await client.query(sql);
 }
 
@@ -270,7 +329,15 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active INTEGER NOT NULL DEFAULT 1;
 `);
 }
 
-const initPromise = initSchema();
+const initPromise = initSchema().catch((err) => {
+    // Do not crash module load from async init errors; requests will still return explicit DB errors.
+    // eslint-disable-next-line no-console
+    console.error(JSON.stringify({
+        level: 'error',
+        message: 'database schema initialization failed',
+        error: err && err.message
+    }));
+});
 
 /**
  * Log an auditable action. Fire-and-forget-safe; callers may choose to await.
@@ -299,4 +366,4 @@ async function logAudit({ businessId, userId, entityType, entityId, action, deta
     }
 }
 
-module.exports = { db, logAudit, initPromise, pool };
+module.exports = { db, logAudit, initPromise };
